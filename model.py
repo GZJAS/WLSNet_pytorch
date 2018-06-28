@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint_sequential
 
 class Watch(nn.Module):
     '''
@@ -10,30 +11,62 @@ class Watch(nn.Module):
     def __init__(self, num_layers, input_size, hidden_size):
         super(Watch, self).__init__()
         self.hidden_size = hidden_size
-
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
         self.encoder = Encoder()
 
-    def forward(self, x):
+    def forward(self, x, length):
         '''
+        lstm + cnn encoder
+
+        1. loop sequence length - 4 (because 4 overlap)
+            cnn encoded each output : 3-D torch tensor, size (bs, 1, 512)
+            concatenated outputs : 3-D torch tensor, size (bs, sequence_length-4, 512)
+
+        2. sort length and x for packing(pytorch pack util needs sorted tensor)
+
+        3. packing, lstm, unpacking
+
+        4. unsort to original order
+
         Parameters
         ----------
-        x : 4-D torch Tensor
-            (batch_size, time_sequence, 120, 120) 
+        x : 4-D torch tensor
+            size (batch_size, sequence_length, 120, 120)
+
+        length : 2-D torch tensor
+            (sequence length-4) of each batch
+            size (batch_size, 1)
+
+        Returns
+        -------
+        outputs : 3-D torch tensor
+            size (batch_size, sequence_length-4, 512)
+
+        states[0] : 3-D torch tensor
+            hidden_state of lstm
+            size (layer_size, batch_size, 512)
         '''
         size = list(x.size())
-
-        assert len(size) == 4, 'video input size is wrong'
-        assert size[2:] == [120, 120], 'image size should 120 * 120'
+        
+        # assert len(size) == 4, 'video input size is wrong'
+        # assert size[2:] == [120, 120], 'image size should 120 * 120'
 
         outputs = []
         for i in range(size[1] - 4):
             outputs.append(self.encoder(x[:, i:i+5, :, :]).unsqueeze(1))
-        outputs.reverse()
         x = torch.cat(outputs, dim=1)
-        outputs, states = self.lstm(x)
+        length, perm_idx = length.sort(0, descending=True)
 
-        return (outputs, states[0])
+        # for i, tensor in enumerate(x):
+        #     tensor[length[i]:, :] = torch.tensor(0)
+
+        x = x[perm_idx].squeeze(1)
+        x = nn.utils.rnn.pack_padded_sequence(x, lengths=length.view(-1).int(), batch_first=True)
+        # self.lstm.flatten_parameters()
+        outputs, states = self.lstm(x)
+        outputs, _ = nn.utils.rnn.pad_packed_sequence(outputs, batch_first=True, padding_value=0)
+        outputs = outputs[perm_idx.sort()[1]]
+        return outputs, states[0]
 
 class Listen(nn.Module):
     '''
@@ -58,7 +91,7 @@ class Listen(nn.Module):
         return (outputs, states[0])
 
 class Spell(nn.Module):
-    def __init__(self, num_layers=3, output_size=45, hidden_size=512):
+    def __init__(self, num_layers, hidden_size, output_size):
         super(Spell, self).__init__()
         self.hidden_size = hidden_size
         self.output_size = output_size
@@ -66,11 +99,19 @@ class Spell(nn.Module):
 
         self.embedded = nn.Embedding(self.output_size, self.hidden_size)
         self.lstm = nn.LSTM(self.hidden_size*2, self.hidden_size, self.num_layers, batch_first=True)
-        self.attentionVideo = Attention(hidden_size, int(hidden_size/2))
-        self.attentionAudio = Attention(hidden_size, int(hidden_size/2))
-        self.mlp = nn.Linear(hidden_size*2, output_size)
+        self.attentionVideo = Attention(hidden_size, hidden_size)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size*2, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Linear(256, output_size)
+        )
+
     
-    def forward(self, input, hidden_state, cell_state, watch_outputs, listen_outputs, context):
+    def forward(self, input, hidden_state, cell_state, watch_outputs, context):
         '''
         1. embedding
             input : (batch_size, 1, hidden_size)
@@ -88,7 +129,7 @@ class Spell(nn.Module):
         5. concatenate two seperate context
             context : (batch_size, 1, encoder_hidden_size * 2)
 
-        6. through mlp layer [output, context] and unsqueeze
+        6. through mlp layer [output, context]
             output : (batch_size, 1, output_size)
 
         Parameters
@@ -122,11 +163,8 @@ class Spell(nn.Module):
         input = self.embedded(input)
         concatenated = torch.cat([input, context], dim=2)
         output, (hidden_state, cell_state) = self.lstm(concatenated, (hidden_state, cell_state))
-        video_context = self.attentionVideo(hidden_state[-1], watch_outputs)
-        audio_context = self.attentionAudio(hidden_state[-1], listen_outputs)
-        context = torch.cat([video_context, audio_context], dim=2)
-        
-        output = self.mlp(torch.cat([output, context], dim=2))
+        context = self.attentionVideo(hidden_state[-1], watch_outputs)
+        output = self.mlp(torch.cat([output, context], dim=2).squeeze(1)).unsqueeze(1)
         
         return output, hidden_state, cell_state, context
 
@@ -148,7 +186,6 @@ class Attention(nn.Module):
 
     def forward(self, prev_hidden_state, annotations):
         '''
-
         1. expand prev_hidden_state dimension and transpose
             prev_hidden_state : (batch_size, sequence_length, feature dimension(512)) 
         
@@ -167,7 +204,7 @@ class Attention(nn.Module):
         Parameters
         ----------
         prev_hidden_state : 3-D torch Tensor
-            (batch_size, hidden_size(default 512))
+            (batch_size, 1, hidden_size(default 512))
         
         annotations : 3-D torch Tensor
             (batch_size, sequence_length, encoder_hidden_size(256))
@@ -217,4 +254,4 @@ class Encoder(nn.Module):
         self.fc = nn.Linear(4608, 512)
 
     def forward(self, x):
-        return self.fc(self.encoder(x).view(x.size(0), -1))
+        return self.fc(checkpoint_sequential(self.encoder, len(self.encoder), x).view(x.size(0), -1))
